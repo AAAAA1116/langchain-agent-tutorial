@@ -180,8 +180,8 @@ graph = (
     .add_edge("tools", "model")   # 这条边就是循环本身
     .compile(checkpointer=MemorySaver())
 )
-# START → model ⇄ approve → tools → model
-#               ↘ (拒绝) → model        ↘ END (无 tool_calls)
+# 用户输入 → model节点 ⇄ approve节点(人工审批) ⇄ tools节点(调工具)
+#                 ↘ (无工具调用 → END)       ↘ (拒绝 → 回model)
 
 if __name__ == "__main__":
     config = {"configurable": {"thread_id": "1"}, "recursion_limit": 10}

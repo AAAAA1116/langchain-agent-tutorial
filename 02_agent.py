@@ -1,0 +1,80 @@
+"""
+LangChain 官方教程: agent + tool 基础
+对应官方文档: https://docs.langchain.com/oss/python/langchain/agents
+LangChain 1.x 统一入口是 create_agent (底层是 LangGraph)。
+Agent 收到问题 -> LLM 判断是否需要调工具 -> 调 calculator -> 汇总回答。
+"""
+import os
+
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+load_dotenv()
+
+
+# ---- 定义一个外部工具: 四则运算计算器 ----
+@tool
+def calculator(expression: str) -> str:
+    """计算一个四则运算表达式并返回结果。输入示例: (3+5)*12"""
+    import ast
+    import operator
+
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.USub: operator.neg,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.operand))
+        raise ValueError(f"不支持的表达式: {expression!r}")
+
+    result = _eval(ast.parse(expression, mode="eval"))
+    return str(result)
+
+
+TOOLS = [calculator]
+
+llm = ChatOpenAI(
+    model="deepseek-chat",
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    base_url="https://api.deepseek.com",
+    temperature=0,
+)
+
+# ---- 创建 agent: 模型 + 工具 + 系统提示词 ----
+agent = create_agent(
+    model=llm,
+    tools=TOOLS,
+    system_prompt="你是一个中文问答助手。遇到数学计算时必须调用 calculator 工具，不要心算。",
+)
+
+if __name__ == "__main__":
+    questions = [
+        "LangChain 是做什么的？一句话回答。",
+        "请问 (128 + 512) * 3 / 4 等于多少？",
+    ]
+    for q in questions:
+        print(f"\n[Q] {q}")
+        result = agent.invoke({"messages": [{"role": "user", "content": q}]})
+        # 打印完整轨迹，能看到 agent 是否真的调用了工具
+        for msg in result["messages"]:
+            role = msg.type
+            if role == "ai" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    print(f"  [调用工具] {tc['name']}({tc['args']})")
+            elif role == "tool":
+                print(f"  [工具返回] {msg.content}")
+            elif role == "ai":
+                print(f"  [A] {msg.content}")

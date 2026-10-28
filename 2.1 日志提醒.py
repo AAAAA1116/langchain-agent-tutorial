@@ -33,6 +33,12 @@ def load_reminders() -> list:
     if not REMINDERS_FILE.exists():
         return []
     data = json.loads(REMINDERS_FILE.read_text(encoding="utf-8"))
+    # json的四个基础函数：
+    # json.dumps(obj) python对象 -> json
+    # json.loads(s) json -> Python对象
+    # json.dump(obj, f) Python对象 -> 写入文件
+    # json.load(f) 读文件 -> Python对象 这两行隐含一个转换
+
     #兼容没 id 字段的旧数据，按顺序补上编号
     for i, r in enumerate(data, 1):
         r.setdefault("id", i)
@@ -110,6 +116,46 @@ def cancel_reminder(reminder_id: int = 0, keyword: str = "") -> str:
     save_reminders([r for r in data if r["id"] != target["id"]])
     return f"已删除提醒 {fmt(target)}"
 
+@tool
+def update_reminder(reminder_id: int, content: str = "", remind_at: str = "", repeat: str = "") -> str:
+    """更新指定编号的提醒。只传要改的字段。
+    Args：
+        reminder_id: id
+        content:
+        reminder_at:
+        repeat:
+
+    """
+    data = load_reminders()
+    target = next((r for r in data if r["id"] == reminder_id), None)
+    if not target:
+        return f"cant find id{reminder_id}."
+
+    if repeat:
+        #枚举和 reminder 保持一致，否则 yearly 能改出来却建不出来
+        if repeat not in ("none", "daily", "weekly", "monthly"):
+            return f"repeat 只能是 none/daily/weekly/monthly，收到的是 {repeat}"
+    #时间和 repeat 无关，单独传也要校验，否则“明天”会被直接写进文件
+    if remind_at:
+        try:
+            datetime.strptime(remind_at, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return f"remind_at 格式不对，要求 YYYY-MM-DD HH:MM，收到的是 {remind_at}"
+        if remind_at == target["remind_at"]:
+            remind_at = ""  #时间和原来一样，视为没改
+
+    if not (content or remind_at or repeat):
+        return f"{fmt(target)} 没有任何改动，检查是不是字段都留空了"
+
+    old = fmt(target)
+    if content:
+        target["content"] = content
+    if remind_at:
+        target["remind_at"] = remind_at
+    if repeat:
+        target["repeat"] = repeat
+    save_reminders(data)
+    return f"已把提醒 {old} 更新为 {fmt(target)}"
 
 llm = ChatOpenAI(
     model="deepseek-chat",
@@ -118,7 +164,7 @@ llm = ChatOpenAI(
     temperature=0,
 )
 
-tools = [get_weather, get_time, reminder, list_reminders, cancel_reminder]
+tools = [get_weather, get_time, reminder, list_reminders, cancel_reminder, update_reminder]
 
 # 绑好工具的模型，节点里直接调它就能带出 tool_calls
 llm_with_tools = llm.bind_tools(tools)
@@ -141,11 +187,13 @@ def call_model(state: MessagesState) -> dict:
     #模型不知道今天几号，不告知就解不了“明天”“下周三”这类相对时间
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
     prompt = (f"今天是 {today}。回答前先调用工具查信息；用户说到待办和时间时调用 reminder 存提醒，"
-              f"问现有提醒时调 list_reminders，要删除时调 cancel_reminder。")
+              f"问现有提醒时调 list_reminders，要删除时调 cancel_reminder，要修改时调 update_reminder，"
+              f"别用先删再建的方式改提醒——两步之间被拒绝会只剩一半。")
     messages = [SystemMessage(content=prompt)] + state["messages"] + repair_dangling(state["messages"])
     response = llm_with_tools.invoke(messages)
     return {"messages": response}
 
+# state = {"messages": [...]}     # 就一个键
 
 # 条件边：看最后一条消息有没有 tool_calls，决定去 tools 还是结束
 def should_continue(state: MessagesState) -> str:
@@ -154,8 +202,9 @@ def should_continue(state: MessagesState) -> str:
 
 
 def approve(state):
+    print(">>> approve 执行了")
     last = state["messages"][-1]
-    answer = interrupt(f"want use to {[tc['name'] for tc in last.tool_calls]}")
+    answer = interrupt(f"agent want use{[tc['name'] for tc in last.tool_calls]}")
     if answer.strip().lower() in ("y", "yes"):
         return {}  #什么都不改
     return {"messages":[
@@ -184,7 +233,8 @@ graph = (
 #               ↘ (拒绝) → model        ↘ END (无 tool_calls)
 
 if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "1"}, "recursion_limit": 10}
+    #一次工具往返吃 4 个超步（model→approve→tools→model），10 只够两轮半，当保险丝太紧
+    config = {"configurable": {"thread_id": "1"}, "recursion_limit": 40}
     while True:
         user_input = input("你:")
         if user_input in ("q", "exit"):
@@ -199,6 +249,11 @@ if __name__ == "__main__":
             answer = input(result["__interrupt__"][0].value + "(y/n)")
             result = graph.invoke(Command(resume=answer), config)
         messages = result["messages"]
+        # 测试repair_dangling
+        # from langchain_core.messages import AIMessage
+        # messages = list(messages) + [
+        #     AIMessage(content="", tool_calls=[{"id": "orphan-test", "name": "reminder", "args": {}}])
+        # ]
         start = next(i for i in range(len(messages) - 1, -1, -1)
                      if messages[i].type == "human")
         for msg in messages[start:]:
@@ -209,3 +264,6 @@ if __name__ == "__main__":
                 print(f"[工具返回] {msg.content}")
             elif msg.type == "ai":
                 print(f"[最终回答] {msg.content}")
+
+        if repair_dangling(messages):
+            print("有工具调用但是未被回复，本轮可能被未处理的暂停打断")
